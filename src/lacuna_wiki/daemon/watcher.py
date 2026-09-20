@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -164,18 +165,34 @@ class RawSourceHandler(FileSystemEventHandler):
 
         embeddings = self._embed_fn([c.text for c in chunks])
 
-        # Determine source type and cite extension from what files exist
+        # Determine source type and cite extension from what files exist,
+        # preferring the .meta.json sidecar written by add-source: it carries
+        # the explicit --type and full --date that filenames cannot express.
         source_dir = abs_path.parent
         has_pdf = (source_dir / f"{key}.pdf").exists()
         has_bib = (source_dir / f"{key}.bib").exists()
+        metadata: dict = {}
+        metadata_path = source_dir / f"{key}.meta.json"
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
 
-        source_type = "paper" if has_pdf else "url"
+        source_type = metadata.get("source_type") or ("paper" if has_pdf else "url")
         cite_ext = ".pdf" if has_pdf else ".md"
 
-        # Read metadata from .bib sidecar if available
+        # Citation metadata (title/authors/year) comes from the .bib sidecar;
+        # the JSON sidecar supplies only the full published date when known.
         title = None
         authors = None
         published_date = None
+        if metadata.get("published_date"):
+            from datetime import date
+            try:
+                published_date = date.fromisoformat(metadata["published_date"])
+            except ValueError:
+                pass
         if has_bib:
             bib_path = source_dir / f"{key}.bib"
             try:
@@ -185,7 +202,7 @@ class RawSourceHandler(FileSystemEventHandler):
                 title = meta.get("title")
                 authors = meta.get("authors")
                 year = meta.get("year")
-                if year:
+                if year and published_date is None:
                     from datetime import date
                     published_date = date(int(year), 1, 1)
             except Exception:

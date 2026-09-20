@@ -6,6 +6,7 @@ DuckDB connection needed in this process.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import tempfile
@@ -106,6 +107,29 @@ def _disambiguate_on_disk(base: str, raw_root: Path, src: Path) -> str:
     raise ValueError(f"Cannot find unique key for '{base}' — too many disambiguations")
 
 
+def _write_metadata_sidecar(
+    dest_dir: Path,
+    key: str,
+    source_type: str,
+    pub_date: "date | None",
+) -> None:
+    """Persist operational metadata the .bib sidecar cannot carry.
+
+    The .bib remains the citation record (title, authors, year). This JSON
+    sidecar holds only what BibTeX cannot round-trip machine-readably: the
+    lacuna source type (bib 'note' is free text) and the full ISO date
+    (bib has year/month fields only). The daemon's RawSourceHandler reads
+    it so explicit --type/--date survive into the sources table.
+    """
+    metadata = {
+        "source_type": source_type,
+        "published_date": pub_date.isoformat() if pub_date else None,
+    }
+    (dest_dir / f"{key}.meta.json").write_text(
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 @click.command("add-source")
 @click.argument("input_path", metavar="PATH_OR_URL")
 @click.option("--concept", default="", help="Subdirectory within raw/ (e.g. machine-learning/attention)")
@@ -180,6 +204,8 @@ def add_source(
             md_dest.write_text(text, encoding="utf-8")
             _write_bib_sidecar(target_dir, key, final_title, final_authors, final_date,
                                source_type or "transcript", url=url)
+            _write_metadata_sidecar(target_dir, key, source_type or "transcript",
+                                    final_date)
             primary_dest = md_dest
             cite_ext = ".md"
             inferred_type = source_type or "transcript"
@@ -260,6 +286,7 @@ def add_source(
                 final_date = date(int(parsed_meta["year"]), 1, 1)
             elif html_meta.get("year"):
                 final_date = date(int(html_meta["year"]), 1, 1)
+            _write_metadata_sidecar(target_dir, key, inferred_type, final_date)
 
         else:
             # --- General URL path: Jina reader ---
@@ -308,6 +335,7 @@ def add_source(
             else:
                 _write_bib_sidecar(target_dir, key, final_title, final_authors, final_date,
                                    source_type or "url", url=url)
+            _write_metadata_sidecar(target_dir, key, source_type or "url", final_date)
 
             primary_dest = md_dest
             cite_ext = ".md"
@@ -346,6 +374,20 @@ def add_source(
                 derive_key(src.stem, conn=None), vault_root / "raw", src,
             )
 
+        final_title = title or parsed_meta.get("title")
+        final_authors = authors or parsed_meta.get("authors")
+        final_date = None
+        if pub_date:
+            final_date = date.fromisoformat(pub_date)
+        elif "year" in parsed_meta:
+            final_date = date(int(parsed_meta["year"]), 1, 1)
+
+        # Sidecars first: the daemon may react to the copied file immediately.
+        _write_metadata_sidecar(target_dir, key, inferred_type, final_date)
+        if not bibtex_str and (final_title or final_authors or final_date):
+            _write_bib_sidecar(target_dir, key, final_title, final_authors,
+                               final_date, inferred_type)
+
         if suffix == ".pdf":
             primary_dest = target_dir / f"{key}.pdf"
             md_dest = target_dir / f"{key}.md"
@@ -359,14 +401,6 @@ def add_source(
             shutil.copy2(src, md_dest)
             primary_dest = md_dest
             cite_ext = suffix
-
-        final_title = title or parsed_meta.get("title")
-        final_authors = authors or parsed_meta.get("authors")
-        final_date = None
-        if pub_date:
-            final_date = date.fromisoformat(pub_date)
-        elif "year" in parsed_meta:
-            final_date = date(int(parsed_meta["year"]), 1, 1)
 
     source_type = inferred_type
     console.print(f"  [green]✓[/green] {primary_dest.relative_to(vault_root)}")
