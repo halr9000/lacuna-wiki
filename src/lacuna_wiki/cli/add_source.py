@@ -82,6 +82,30 @@ def _write_bib_sidecar(
     (dest_dir / f"{key}.bib").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _disambiguate_on_disk(base: str, raw_root: Path, src: Path) -> str:
+    """Return a key that is unique across the raw/ tree on disk.
+
+    add-source runs without a DB connection, so _disambiguate(conn=None)
+    cannot see existing slugs and same-named files (e.g. two projects'
+    README.md) silently collide: the daemon skips registration when the
+    slug already exists. Mirror _disambiguate's b..z suffix scheme, but
+    check the filesystem instead of the sources table. Re-adding a file
+    whose content is unchanged reuses its existing key, keeping
+    ingestion idempotent.
+    """
+    src_bytes = src.read_bytes()
+    suffix = src.suffix.lower()
+    for tag in [""] + list("bcdefghijklmnopqrstuvwxyz"):
+        candidate = base + tag
+        existing = list(raw_root.rglob(f"{candidate}.*"))
+        if not existing:
+            return candidate
+        for path in existing:
+            if path.suffix.lower() == suffix and path.read_bytes() == src_bytes:
+                return candidate
+    raise ValueError(f"Cannot find unique key for '{base}' — too many disambiguations")
+
+
 @click.command("add-source")
 @click.argument("input_path", metavar="PATH_OR_URL")
 @click.option("--concept", default="", help="Subdirectory within raw/ (e.g. machine-learning/attention)")
@@ -318,7 +342,9 @@ def add_source(
         if bibtex_str:
             key = derive_key_from_bibtex(bibtex_str, conn=None)
         else:
-            key = derive_key(src.stem, conn=None)
+            key = _disambiguate_on_disk(
+                derive_key(src.stem, conn=None), vault_root / "raw", src,
+            )
 
         if suffix == ".pdf":
             primary_dest = target_dir / f"{key}.pdf"
